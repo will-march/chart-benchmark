@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Chart Library Benchmark</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: ui-monospace, monospace; background: #0b0f17; color: #c8d0de; padding: 24px; }
+    h1 { font-size: 18px; color: #fff; margin-bottom: 4px; }
+    .sub { color: #6a7a90; font-size: 12px; margin-bottom: 24px; max-width: 720px; }
+    .run-btn { background: #2563eb; color: #fff; border: none; padding: 10px 24px;
+               border-radius: 6px; font-family: inherit; font-size: 13px; cursor: pointer; }
+    .run-btn:disabled { opacity: 0.4; cursor: default; }
+    #status { margin: 16px 0; font-size: 12px; color: #6a7a90; min-height: 18px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 12px; }
+    th { text-align: left; padding: 8px 12px; border-bottom: 1px solid #1e2a3a;
+         color: #6a7a90; letter-spacing: 0.08em; font-size: 10px; }
+    td { padding: 8px 12px; border-bottom: 1px solid #111820; }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .good { color: #22c55e; } .warn { color: #f59e0b; } .bad { color: #ef4444; }
+    .chart-wrap { margin: 16px 0; border: 1px solid #1e2a3a; border-radius: 6px; overflow: hidden; }
+    .chart-label { padding: 6px 10px; background: #111820; font-size: 10px;
+                   color: #6a7a90; letter-spacing: 0.1em; }
+    #lw-mount, #ech-mount { width: 100%; height: 280px; }
+    #benchmark-results { display: none; }
+  </style>
+</head>
+<body>
+  <h1>Chart Library Benchmark</h1>
+  <p class="sub">
+    Measures <strong>synchronous render time</strong> per operation (Canvas 2D draw calls are
+    synchronous JS). Each test drives 500 pan steps + 200 zoom steps programmatically and
+    records the wall-clock time for each call. Reports p50/p95/max in ms and effective FPS
+    at 60Hz (ops that take &gt;16.67ms would drop a frame).
+  </p>
+
+  <button class="run-btn" id="runBtn" onclick="runAll()">Run benchmark</button>
+  <div id="status">Ready.</div>
+
+  <div class="chart-wrap">
+    <div class="chart-label">LIGHTWEIGHT CHARTS</div>
+    <div id="lw-mount"></div>
+  </div>
+  <div class="chart-wrap">
+    <div class="chart-label">APACHE ECHARTS</div>
+    <div id="ech-mount"></div>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Library</th>
+        <th>Candles</th>
+        <th class="num">setData (ms)</th>
+        <th class="num">Pan p50 (ms)</th>
+        <th class="num">Pan p95 (ms)</th>
+        <th class="num">Pan max (ms)</th>
+        <th class="num">Zoom p50 (ms)</th>
+        <th class="num">Zoom p95 (ms)</th>
+        <th class="num">Eff FPS (pan)</th>
+        <th class="num">Heap (MB)</th>
+      </tr>
+    </thead>
+    <tbody id="tbody"></tbody>
+  </table>
+
+  <pre id="benchmark-results"></pre>
+
+  <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@5.0.5/dist/lightweight-charts.standalone.production.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.6.0/dist/echarts.min.js"></script>
+  <script>
+  const MOUNT_W = 800;
+  const MOUNT_H = 280;
+  const PAN_STEPS  = 500;
+  const ZOOM_STEPS = 200;
+
+  // ── data generation ───────────────────────────────────────────────────────
+  function generateCandles(count) {
+    const out = [];
+    let ts = 1_700_000_000, close = 50_000;
+    for (let i = 0; i < count; i++) {
+      const body = (Math.random() - 0.48) * close * 0.012;
+      const open = close;
+      close = Math.max(1, open + body);
+      const hi = Math.max(open, close) * (1 + Math.random() * 0.005);
+      const lo = Math.min(open, close) * (1 - Math.random() * 0.005);
+      out.push({ time: ts, open, high: hi, low: lo, close });
+      ts += 3_600;
+    }
+    return out;
+  }
+
+  // ── stats ─────────────────────────────────────────────────────────────────
+  function stats(arr) {
+    arr.sort((a, b) => a - b);
+    const p = (pct) => arr[Math.min(arr.length - 1, Math.floor(arr.length * pct))];
+    return {
+      p50: +p(0.50).toFixed(3),
+      p95: +p(0.95).toFixed(3),
+      max: +p(1.00).toFixed(3),
+    };
+  }
+
+  function heapMB() {
+    return performance.memory
+      ? +(performance.memory.usedJSHeapSize / 1e6).toFixed(1)
+      : null;
+  }
+
+  function effFps(p50ms) {
+    return Math.min(60, Math.round(1000 / Math.max(p50ms, 0.01)));
+  }
+
+  function fpsClass(fps) {
+    return fps >= 55 ? 'good' : fps >= 30 ? 'warn' : 'bad';
+  }
+
+  const allResults = [];
+
+  function addRow(lib, count, r) {
+    const fps = effFps(r.pan.p50);
+    const tb = document.getElementById('tbody');
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${lib}</td>
+      <td class="num">${count.toLocaleString()}</td>
+      <td class="num">${r.setDataMs}</td>
+      <td class="num">${r.pan.p50}</td>
+      <td class="num">${r.pan.p95}</td>
+      <td class="num">${r.pan.max}</td>
+      <td class="num">${r.zoom.p50}</td>
+      <td class="num">${r.zoom.p95}</td>
+      <td class="num ${fpsClass(fps)}">${fps >= 60 ? '≥60' : fps} fps</td>
+      <td class="num">${r.heap ?? '—'}</td>
+    `;
+    tb.appendChild(tr);
+  }
+
+  // ── Lightweight Charts ────────────────────────────────────────────────────
+  async function benchLW(count) {
+    const mount = document.getElementById('lw-mount');
+    mount.innerHTML = '';
+    const chart = LightweightCharts.createChart(mount, {
+      width: MOUNT_W, height: MOUNT_H,
+      layout: { background: { color: '#111820' }, textColor: '#6a7a90' },
+      grid: { vertLines: { color: '#1e2a3a' }, horzLines: { color: '#1e2a3a' } },
+      handleScroll: false, handleScale: false,
+    });
+    const series = chart.addSeries(LightweightCharts.CandlestickSeries, {
+      upColor: '#22c55e', downColor: '#ef4444', borderVisible: false,
+      wickUpColor: '#22c55e', wickDownColor: '#ef4444',
+    });
+    const candles = generateCandles(count);
+
+    // measure setData
+    const t0 = performance.now();
+    series.setData(candles);
+    chart.timeScale().fitContent();
+    const setDataMs = +(performance.now() - t0).toFixed(2);
+
+    // allow one paint
+    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+    // pan: drive scrollToPosition through the full range
+    const panTimes = [];
+    for (let i = 0; i < PAN_STEPS; i++) {
+      const offset = Math.sin((i / PAN_STEPS) * Math.PI * 2) * (count * 0.45);
+      const t = performance.now();
+      chart.timeScale().scrollToPosition(offset, false);
+      panTimes.push(performance.now() - t);
+    }
+    await new Promise(r => requestAnimationFrame(r));
+
+    // zoom: drive setVisibleRange from narrow to wide
+    const zoomTimes = [];
+    for (let i = 0; i < ZOOM_STEPS; i++) {
+      const pct = 0.02 + Math.abs(Math.sin((i / ZOOM_STEPS) * Math.PI)) * 0.97;
+      const from = candles[0].time;
+      const to   = candles[Math.max(1, Math.floor(pct * (count - 1)))].time;
+      const t = performance.now();
+      chart.timeScale().setVisibleRange({ from, to });
+      zoomTimes.push(performance.now() - t);
+    }
+    await new Promise(r => requestAnimationFrame(r));
+
+    const heap = heapMB();
+    chart.remove();
+    return { setDataMs, pan: stats(panTimes), zoom: stats(zoomTimes), heap };
+  }
+
+  // ── ECharts ───────────────────────────────────────────────────────────────
+  async function benchECharts(count) {
+    const mount = document.getElementById('ech-mount');
+    mount.innerHTML = '';
+    const ec = echarts.init(mount, null, { width: MOUNT_W, height: MOUNT_H });
+    const candles = generateCandles(count);
+    const ecData  = candles.map(c => [c.open, c.close, c.low, c.high]);
+    const times   = candles.map((_, i) => String(i)); // numeric indices — avoids date parse cost
+
+    const t0 = performance.now();
+    ec.setOption({
+      animation: false,
+      grid:   { top: 20, bottom: 40, left: 60, right: 20 },
+      xAxis:  { type: 'category', data: times, show: false },
+      yAxis:  { scale: true },
+      series: [{ type: 'candlestick', data: ecData }],
+      dataZoom: [{ type: 'inside', start: 0, end: 100 }],
+    });
+    const setDataMs = +(performance.now() - t0).toFixed(2);
+
+    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+    // pan via dataZoom window shift
+    const winPct   = Math.min(80, Math.round(3_000 / count * 100) + 3);
+    const panTimes = [];
+    for (let i = 0; i < PAN_STEPS; i++) {
+      const phase = (i / PAN_STEPS);
+      const start = Math.max(0, Math.min(100 - winPct,
+        Math.round(Math.abs(Math.sin(phase * Math.PI * 2)) * (100 - winPct))));
+      const t = performance.now();
+      ec.dispatchAction({ type: 'dataZoom', dataZoomIndex: 0, start, end: start + winPct });
+      panTimes.push(performance.now() - t);
+    }
+    await new Promise(r => requestAnimationFrame(r));
+
+    // zoom via dataZoom end change
+    const zoomTimes = [];
+    for (let i = 0; i < ZOOM_STEPS; i++) {
+      const sz = 3 + Math.abs(Math.sin((i / ZOOM_STEPS) * Math.PI)) * 96;
+      const t = performance.now();
+      ec.dispatchAction({ type: 'dataZoom', dataZoomIndex: 0, start: 0, end: sz });
+      zoomTimes.push(performance.now() - t);
+    }
+    await new Promise(r => requestAnimationFrame(r));
+
+    const heap = heapMB();
+    ec.dispose();
+    return { setDataMs, pan: stats(panTimes), zoom: stats(zoomTimes), heap };
+  }
+
+  // ── runner ────────────────────────────────────────────────────────────────
+  const COUNTS = [1_000, 5_000, 10_000, 50_000, 100_000];
+
+  async function runAll() {
+    document.getElementById('runBtn').disabled = true;
+    document.getElementById('tbody').innerHTML = '';
+    allResults.length = 0;
+    const setStatus = msg => { document.getElementById('status').textContent = msg; };
+
+    for (const count of COUNTS) {
+      setStatus(`Lightweight Charts · ${count.toLocaleString()} candles…`);
+      const lw = await benchLW(count);
+      allResults.push({ library: 'lightweight-charts', candles: count, ...lw });
+      addRow('Lightweight Charts', count, lw);
+      await new Promise(r => setTimeout(r, 200));
+
+      setStatus(`ECharts · ${count.toLocaleString()} candles…`);
+      const ec = await benchECharts(count);
+      allResults.push({ library: 'echarts', candles: count, ...ec });
+      addRow('ECharts', count, ec);
+      await new Promise(r => setTimeout(r, 200));
+    }
+
+    const output = {
+      date: new Date().toISOString(),
+      ua: navigator.userAgent,
+      note: [
+        'All times in ms. p50/p95/max = percentile of per-operation synchronous render time.',
+        'Eff FPS = min(60, 1000/p50). Canvas 2D render calls are synchronous JS.',
+        'Hardware: see UA. Headless Chromium, GPU-accelerated (--use-gl=angle).',
+        'Pan = 500 scrollToPosition() calls across full data range.',
+        'Zoom = 200 setVisibleRange() calls from 2% to 99% of data range.',
+      ].join(' '),
+      results: allResults,
+    };
+
+    const pre = document.getElementById('benchmark-results');
+    pre.textContent = JSON.stringify(output, null, 2);
+    pre.style.display = 'block';
+
+    setStatus('Done. See table above and #benchmark-results for raw JSON.');
+    document.getElementById('runBtn').disabled = false;
+  }
+  </script>
+</body>
+</html>

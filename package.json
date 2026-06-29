@@ -1,0 +1,15 @@
+{
+  "name": "chart-benchmark",
+  "version": "1.0.0",
+  "description": "Benchmark: Lightweight Charts vs ECharts vs WebGL — FPS at 1k/5k/10k/50k/100k candles",
+  "type": "module",
+  "scripts": {
+    "bench": "node run-benchmark.js",
+    "bench:headed": "node run-benchmark.js --headed",
+    "serve": "npx serve . -p 3456"
+  },
+  "devDependencies": {
+    "playwright": "^1.59.1",
+    "serve": "^14.2.4"
+  }
+}
