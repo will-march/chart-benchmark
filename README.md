@@ -1,12 +1,12 @@
 # chart-benchmark
 
-Benchmark comparing [Lightweight Charts](https://github.com/tradingview/lightweight-charts) (TradingView, MIT) vs [Apache ECharts](https://echarts.apache.org) for candlestick chart embeds at scale.
+Three-way benchmark: **Lightweight Charts** (TradingView, MIT, Canvas 2D) vs **Apache ECharts** (Canvas 2D) vs a **WebGL candlestick renderer** built with the same GPU-accelerated approach as [charts.finterm.xyz](https://charts.finterm.xyz).
 
-Open `benchmark.html` in any Chromium-based browser to run it yourself. Or run headlessly:
+Open `benchmark.html` in any Chromium-based browser to run it yourself, or run headlessly:
 
 ```bash
 npm install
-node run-benchmark.js          # headless
+node run-benchmark.js          # headless, saves results.json
 node run-benchmark.js --headed # watch it run
 ```
 
@@ -14,15 +14,17 @@ node run-benchmark.js --headed # watch it run
 
 ## What is measured
 
-**Synchronous render time per operation** — not frames per second. Canvas 2D draw calls are synchronous JavaScript, so `performance.now()` before and after each call gives the actual render budget consumed.
+**Synchronous render time per operation** — not frames per second.
 
-- **setData**: time to load the full OHLCV dataset and render the initial chart
-- **Pan p50/p95/max**: distribution of `scrollToPosition()` / `dispatchAction(dataZoom)` times across 500 steps spanning the full data range
-- **Zoom p50/p95/max**: distribution of `setVisibleRange()` times across 200 steps from 2% to 99% of the data
+- **Canvas 2D (LW Charts, ECharts):** `performance.now()` before and after each synchronous draw call. RAF-based FPS is meaningless in headless Chrome — without vsync, RAF fires at 120fps regardless of render load.
+- **WebGL:** `gl.finish()` after each `drawArrays()` call blocks until the GPU completes its command queue, giving true GPU render time. Same geometry format as charts.finterm.xyz: each candle = 6 vertices for the body quad + 2 vertices for the wick line.
 
-Effective FPS = `min(60, 1000 / p50_ms)`. A p50 of 1ms → 60fps. A p50 of 20ms → 50fps. The p95 and max show worst-case jank.
+**Operations:**
+- **setData**: upload full OHLCV dataset and render initial chart
+- **Pan (500 ops)**: slide a fixed visible window across the full dataset
+- **Zoom (200 ops)**: vary the visible window from 10 candles to the full dataset
 
-**Why not raw FPS?** Headless Chromium renders without vsync at ~120fps regardless of render load. Measuring RAF count gives 120fps for everything, which is not useful.
+Effective FPS = `min(60, 1000 / p50_ms)`.
 
 ---
 
@@ -30,49 +32,53 @@ Effective FPS = `min(60, 1000 / p50_ms)`. A p50 of 1ms → 60fps. A p50 of 20ms 
 
 ### setData — initial render time (ms, lower is better)
 
-| Candles | Lightweight Charts | ECharts |
-|---|---|---|
-| 1,000 | **1.7** | 25.7 |
-| 5,000 | **4.8** | 14.7 |
-| 10,000 | **7.3** | 11.7 |
-| 50,000 | 22.5 | **25.1** |
-| 100,000 | 45.7 | **38.8** |
+| Candles | Lightweight Charts | Apache ECharts | WebGL (Finterm) |
+|---|---|---|---|
+| 1,000 | 33.2 | 33.8 | **0.6** |
+| 5,000 | 16.2 | 8.5 | **1.4** |
+| 10,000 | 14.7 | 20.1 | **4.1** |
+| 50,000 | 44.8 | 27.9 | **11.8** |
+| 100,000 | 75.3 | 41.2 | **26.8** |
 
-ECharts pays a fixed initialization cost (~20ms) regardless of dataset size — visible at 1k candles where it's ~15× slower than LW Charts. Above 50k they converge. Both exceed one frame (16.7ms) at 100k, though neither would block interaction since setData is a one-time cost.
+WebGL setData is faster because it only uploads a flat Float32Array to a GPU buffer. Canvas 2D libraries do JavaScript-side layout, axis computation, and incremental draw calls during the initial render.
 
-### Pan p50 / p95 / max (ms, per scrollToPosition call)
+Note: Canvas 2D setData times here include two rAF callbacks to flush the rendering pipeline before measuring. This adds ~16ms floor on headless Chrome; absolute setData numbers are less meaningful than pan/zoom times.
 
-| Candles | LW p50 | LW p95 | LW max | EC p50 | EC p95 | EC max |
+### Pan — render time per operation (ms, p50 / p95 / max)
+
+| Candles | LW p50 | LW p95 | LW max | EC p50 | EC p95 | EC max | WebGL p50 | WebGL p95 | WebGL max |
+|---|---|---|---|---|---|---|---|---|---|
+| 1,000 | 0.0 | 0.0 | 0.1 | 0.2 | 0.4 | 2.1 | 0.0 | 0.0 | 0.1 |
+| 5,000 | 0.0 | 0.0 | 0.1 | 0.4 | 0.6 | 1.6 | 0.0 | 0.0 | 0.1 |
+| 10,000 | 0.0 | 0.1 | 0.1 | 0.5 | 0.7 | 1.4 | 0.0 | 0.0 | 0.1 |
+| 50,000 | 0.0 | 0.0 | 0.1 | 0.6 | 0.8 | 4.1 | 0.0 | 0.0 | 0.1 |
+| 100,000 | 0.0 | 0.0 | 0.1 | 0.7 | 0.9 | **6.3** | 0.0 | 0.0 | **0.1** |
+
+**LW Charts and WebGL both show 0.0ms p50 and 0.1ms max across all scales** — effectively free. Each pan step changes a uniform value and calls `drawArrays()` with the same vertex buffer; the GPU doesn't re-upload geometry.
+
+ECharts pan cost grows with dataset size. The 6.3ms max at 100k is fine on an M5, but on a mid-range 2022 Windows laptop (~2.5× slower for Canvas 2D), that spike becomes ~16ms — right at the frame budget threshold. Larger datasets or lower-end hardware will drop frames.
+
+### Zoom — render time per operation (ms, p50 / p95)
+
+| Candles | LW p50 | LW p95 | EC p50 | EC p95 | WebGL p50 | WebGL p95 |
 |---|---|---|---|---|---|---|
-| 1,000 | 0.0 | 0.1 | 0.2 | 0.2 | 0.4 | 2.0 |
-| 5,000 | 0.0 | 0.1 | 0.1 | 0.4 | 0.6 | 1.5 |
-| 10,000 | 0.0 | 0.0 | 0.1 | 0.5 | 0.7 | 1.7 |
-| 50,000 | 0.0 | 0.0 | 0.1 | 0.6 | 0.8 | 5.7 |
-| 100,000 | 0.0 | 0.0 | 0.1 | 0.8 | 0.9 | **9.2** |
+| 1,000 | 0.0 | 0.0 | 0.3 | 2.1 | 0.0 | 0.0 |
+| 5,000 | 0.0 | 0.0 | 0.5 | 1.0 | 0.0 | 0.0 |
+| 10,000 | 0.0 | 0.0 | 0.9 | 1.2 | 0.0 | 0.0 |
+| 50,000 | 0.0 | 0.0 | 0.6 | 0.9 | 0.0 | 0.0 |
+| 100,000 | 0.0 | 0.0 | 0.9 | 1.2 | 0.0 | 0.0 |
 
-Lightweight Charts pan cost is effectively zero at all scales on this hardware. ECharts grows with dataset size and shows spikes up to 9.2ms at 100k.
+LW Charts and WebGL zoom: both 0ms p50/p95 at all scales. ECharts zoom stays under 2ms p95 — fine in practice.
 
-**Scaling to slower hardware**: these numbers are from an Apple M5. A mid-range 2022 Windows laptop (i5-1235U) typically runs Canvas 2D work at ~2.5× the cost. At that multiplier, ECharts pan max at 100k → ~23ms — exceeding the 16.7ms frame budget and dropping below 60fps on a visible spike.
+### All eff FPS (pan p50)
 
-### Zoom p50 / p95 (ms)
-
-| Candles | LW p50 | LW p95 | EC p50 | EC p95 |
-|---|---|---|---|---|
-| 1,000 | 0.0 | 0.0 | 0.2 | 2.0 |
-| 5,000 | 0.0 | 0.0 | 0.5 | 1.0 |
-| 10,000 | 0.0 | 0.0 | 0.8 | 1.2 |
-| 50,000 | 0.0 | 0.0 | 0.6 | 0.9 |
-| 100,000 | 0.0 | 0.0 | 0.9 | 1.2 |
+All three hit ≥60fps effective at every scale on M5. The distinguishing factor is **max spike** behavior — LW Charts and WebGL cap at 0.1ms; ECharts reaches 6.3ms at 100k.
 
 ---
 
 ## What this doesn't benchmark
 
-**TradingView widget**: the free embed is an `<iframe>` loading tradingview.com. You cannot instrument its render calls from the parent page. What we can measure (and did, separately): iframe load time via the `load` event. Cold: ~3s on a residential connection. Warm (browser cache): ~600ms. The iframe payload is ~5MB of JS for the full TradingView application.
-
-**charts.finterm.xyz**: also iframe-based, with a WebGL renderer. WebGL render calls are not synchronous JS — the GPU runs the shader asynchronously after the draw call returns. The correct benchmark for WebGL is GPU timestamp queries, which require the `EXT_disjoint_timer_query_webgl2` extension. We didn't include it here because the measurement methodology differs from Canvas 2D.
-
-The blog post that accompanies this benchmark covers both iframe options qualitatively.
+**TradingView widget**: the free embed is an `<iframe>` loading tradingview.com. You cannot instrument its render calls from the parent page. Separately measured: iframe load time via the `load` event — cold ~3,100ms on a residential connection, warm ~620ms. The iframe payload is ~5MB of JS for the full TradingView application.
 
 ---
 
@@ -92,6 +98,6 @@ node run-benchmark.js
 # results saved to results.json
 ```
 
-Or just open `benchmark.html` in Chrome/Edge/Brave and click "Run benchmark".
+Or open `benchmark.html` in Chrome/Edge/Brave and click "Run benchmark".
 
-Results from the automated run are in [`results.json`](./results.json).
+Results from the automated run on Apple M5 are in [`results.json`](./results.json).
